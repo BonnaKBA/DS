@@ -1,7 +1,11 @@
 import os
+import re
 import discord
+import asyncio
 from dotenv import load_dotenv
 from discord.ext import commands
+from discord import app_commands
+from datetime import timedelta, datetime
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -12,6 +16,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents, application_id=APPLICATION_ID)
 
 USER_FILE = "users.txt"
+
+CHAT_BANNED_ROLE_ID = 1369193048742957120
+VOICE_BANNED_ROLE_ID = 1369192967470059622
+MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
 
 def is_user_allowed(user_id):
     if not os.path.exists(USER_FILE):
@@ -146,5 +154,161 @@ async def clear_show(interaction: discord.Interaction):
             await interaction.response.send_message("Список разрешенных пользователей пуст.", ephemeral=True)
     else:
         await interaction.response.send_message("Файл с разрешенными пользователями не найден.", ephemeral=True)
+
+def parse_duration(duration: str) -> int:
+    """Преобразует строку (например, '10m', '2h') в секунды"""
+    match = re.fullmatch(r"(\d+)([smhd])", duration)
+    if not match:
+        return None
+    value, unit = match.groups()
+    value = int(value)
+    if unit == "s":
+        return value
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 3600
+    if unit == "d":
+        return value * 86400
+    return None
+
+UNITS = {
+    "seconds": 1,
+    "minutes": 60,
+    "hours": 3600,
+    "days": 86400
+}
+
+def get_time_unit(unit: str, amount: int) -> str:
+    suffixes = {
+        "seconds": ["секунду", "секунды", "секунд"],
+        "minutes": ["минуту", "минуты", "минут"],
+        "hours": ["час", "часа", "часов"],
+        "days": ["день", "дня", "дней"]
+}
+    forms = suffixes.get(unit, [unit, unit, unit])
+    if 11 <= amount % 100 <= 14:
+        return forms[2]
+    elif amount % 10 == 1:
+        return forms[0]
+    elif 2 <= amount % 10 <= 4:
+        return forms[1]
+    return forms[2]
+
+
+@app_commands.describe(
+    user="Кого ограничить",
+    scope="Канал — только в этом канале, Сервер — на всём сервере",
+    amount="Время блокировки",
+    unit="Единица времени (секунды, минуты, часы, дни)"
+)
+@app_commands.choices(
+    unit=[
+        app_commands.Choice(name="секунды", value="seconds"),
+        app_commands.Choice(name="минуты", value="minutes"),
+        app_commands.Choice(name="часы", value="hours"),
+        app_commands.Choice(name="дни", value="days")
+    ]
+)
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="Сервер", value="server"),
+        app_commands.Choice(name="Канал", value="channel"),
+    ]
+)
+@app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="lock", description="Ограничить пользователя")  # <- должен быть самым верхним
+async def lock(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    scope: str,
+    amount: int = None,
+    unit: app_commands.Choice[str] = None
+):
+    await interaction.response.defer(ephemeral=True)
+
+    # Проверка на администратора и иерархию ролей
+    if user.guild_permissions.administrator:
+        await interaction.followup.send("❌ Нельзя ограничить администратора.", ephemeral=True)
+        return
+
+    if user.top_role >= interaction.guild.me.top_role:
+        await interaction.followup.send("❌ У пользователя роль выше или равна роли бота. Ограничение невозможно.", ephemeral=True)
+        return
+
+    # Обязательная пара: amount + unit
+    if (amount is None and unit is not None) or (amount is not None and unit is None):
+        await interaction.followup.send(
+            "⚠️ Укажите и `amount`, и `unit` вместе, либо не указывайте вовсе для максимальной блокировки.",
+            ephemeral=True
+        )
+        return
+
+    if amount == 0:
+        await interaction.followup.send("⚠️ Значение времени не может быть равно 0.", ephemeral=True)
+        return
+
+    # ================= Channel scope ==================
+    if scope == "channel":
+        chat_banned_role = interaction.guild.get_role(CHAT_BANNED_ROLE_ID)
+        if not chat_banned_role:
+            await interaction.followup.send("Не найдена роль chat banned.", ephemeral=True)
+            return
+
+        await user.add_roles(chat_banned_role)
+        await interaction.channel.set_permissions(user, send_messages=False)
+        await interaction.followup.send(f"🔒 {user.mention} теперь не может писать в этом канале.", ephemeral=True)
+        return
+
+    # ================= Server scope ==================
+    elif scope == "server":
+        if amount and unit:
+            if unit.value not in UNITS:
+                await interaction.followup.send("Неверно указана единица времени.", ephemeral=True)
+                return
+
+            seconds = amount * UNITS[unit.value]
+            if seconds > MAX_TIMEOUT_SECONDS:
+                await interaction.followup.send("Максимальное время таймаута — 28 дней.", ephemeral=True)
+                return
+
+            until = discord.utils.utcnow() + timedelta(seconds=seconds)
+            unit_str = get_time_unit(unit.value, amount)
+            duration_text = f"на {amount} {unit_str}"
+        else:
+            until = discord.utils.utcnow() + timedelta(days=28)
+            duration_text = "максимально (28 дней макс)"
+
+        try:
+            await user.timeout(until, reason="Server lock")
+        except discord.Forbidden:
+            await interaction.followup.send("Нет прав ограничить этого пользователя.", ephemeral=True)
+            return
+
+        await interaction.followup.send(f"🔒 {user.mention} ограничен {duration_text}.", ephemeral=True)
+        
+# Команда /unlock для снятия блокировки с пользователя
+@bot.tree.command(name="unlock", description="Снять ограничение на отправку сообщений у пользователя")
+@app_commands.checks.has_permissions(administrator=True)
+async def unlock(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    scope: str = "channel"  # или "server"
+):
+    # Снимаем блокировку в указанном scope
+    if scope == "channel":
+        await user.remove_timeout()
+        await interaction.response.send_message(f"{user.mention} разблокирован в этом канале.", ephemeral=True)
+    elif scope == "server":
+        await user.remove_timeout()
+        await interaction.response.send_message(f"{user.mention} разблокирован на сервере.", ephemeral=True)
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ У вас нет прав администратора для использования данной команды.",
+            ephemeral=True
+        )
 
 bot.run(TOKEN)
