@@ -35,5 +35,15 @@ services:
     depends_on:
       - second_db
 
+  php:
+    image: php:8.2-apache
+    container_name: fun_zone_php
+    ports:
+      - "8889:80"
+    volumes:
+      - ./php:/var/www/html
+    depends_on:
+      - fun-zone
+
 volumes:
   funzone_db:
