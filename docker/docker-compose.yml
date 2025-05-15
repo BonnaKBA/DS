@@ -41,7 +41,7 @@ services:
     ports:
       - "8889:80"
     volumes:
-      - ./php:/var/www/html
+      - ./funzone_php:/var/www/html
     depends_on:
       - fun-zone
 
