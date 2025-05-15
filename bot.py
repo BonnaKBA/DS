@@ -254,7 +254,6 @@ async def lock(
             return
 
         await user.add_roles(chat_banned_role)
-        await interaction.channel.set_permissions(user, send_messages=False)
         await interaction.followup.send(f"🔒 {user.mention} теперь не может писать в этом канале.", ephemeral=True)
         return
 
@@ -278,24 +277,56 @@ async def lock(
         try:
             await user.timeout(until, reason="Server lock")
         except discord.Forbidden:
-            await interaction.followup.send("Нет прав ограничить этого пользователя.", ephemeral=True)
+            await interaction.followup.send("❌ Нет прав ограничить этого пользователя.", ephemeral=True)
             return
 
         await interaction.followup.send(f"🔒 {user.mention} ограничен {duration_text}.", ephemeral=True)
-        
-@bot.tree.command(name="unlock", description="Снять ограничение на отправку сообщений у пользователя")
+
+@app_commands.describe(
+    user="Кого разблокировать",
+    scope="Где снять ограничение: канал или сервер"
+)
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="Сервер", value="server"),
+        app_commands.Choice(name="Канал", value="channel"),
+    ]
+)
 @app_commands.checks.has_permissions(administrator=True)
+@bot.tree.command(name="unlock", description="Снять ограничение на отправку сообщений у пользователя")
 async def unlock(
     interaction: discord.Interaction,
     user: discord.Member,
-    scope: str = "channel" 
+    scope: app_commands.Choice[str]
 ):
-    if scope == "channel":
-        await user.remove_timeout()
-        await interaction.response.send_message(f"{user.mention} разблокирован в этом канале.", ephemeral=True)
-    elif scope == "server":
-        await user.remove_timeout()
-        await interaction.response.send_message(f"{user.mention} разблокирован на сервере.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+
+    if user.guild_permissions.administrator:
+        await interaction.followup.send("❌ У администратора нет ограничений.", ephemeral=True)
+        return
+
+    if user.top_role >= interaction.guild.me.top_role:
+        await interaction.followup.send("❌ У пользователя роль выше или равна роли бота. Снятие невозможно.", ephemeral=True)
+        return
+
+    if scope.value == "channel":
+        chat_banned_role = interaction.guild.get_role(CHAT_BANNED_ROLE_ID)
+        if not chat_banned_role:
+            await interaction.followup.send("❌ Роль chat banned не найдена.", ephemeral=True)
+            return
+
+        if chat_banned_role in user.roles:
+            await user.remove_roles(chat_banned_role)
+            await interaction.followup.send(f"🔓 {user.mention} разблокирован в этом канале.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"{user.mention} не был заблокирован в канале.", ephemeral=True)
+
+    elif scope.value == "server":
+        try:
+            await user.timeout(None)
+            await interaction.followup.send(f"🔓 {user.mention} разблокирован на сервере.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Нет прав разблокировать пользователя.", ephemeral=True)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
