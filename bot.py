@@ -18,7 +18,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents, application_id=APPLICATION_ID)
 
-USER_FILE = "users.txt"
+USER_FILE = "clear_users.txt"
 
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
 
@@ -201,7 +201,8 @@ def get_time_unit(unit: str, amount: int) -> str:
     user="Кого ограничить",
     scope="Канал — только в этом канале, Сервер — на всём сервере",
     amount="Время блокировки",
-    unit="Единица времени (секунды, минуты, часы, дни)"
+    unit="Единица времени (секунды, минуты, часы, дни)",
+    reason="Причина ограничения"
 )
 @app_commands.choices(
     unit=[
@@ -223,6 +224,7 @@ async def lock(
     interaction: discord.Interaction,
     user: discord.Member,
     scope: str,
+    reason: str,
     amount: int = None,
     unit: app_commands.Choice[str] = None
 ):
@@ -235,7 +237,7 @@ async def lock(
     if user.top_role >= interaction.guild.me.top_role:
         await interaction.followup.send("❌ У пользователя роль выше или равна роли бота. Ограничение невозможно.", ephemeral=True)
         return
-    
+
     if (amount is None and unit is not None) or (amount is not None and unit is None):
         await interaction.followup.send(
             "⚠️ Укажите и `amount`, и `unit` вместе, либо не указывайте вовсе для максимальной блокировки.",
@@ -253,8 +255,8 @@ async def lock(
             await interaction.followup.send("Не найдена роль chat banned.", ephemeral=True)
             return
 
-        await user.add_roles(chat_banned_role)
-        await interaction.followup.send(f"🔒 {user.mention} теперь не может писать в этом канале.", ephemeral=True)
+        await user.add_roles(chat_banned_role, reason=reason)
+        await interaction.followup.send(f"🔒 {user.mention} теперь не может писать в этом канале.\n**Причина:** {reason}", ephemeral=True)
         return
 
     elif scope == "server":
@@ -274,17 +276,19 @@ async def lock(
         else:
             until = discord.utils.utcnow() + timedelta(days=28)
             duration_text = "максимально (28 дней макс)"
+
         try:
-            await user.timeout(until, reason="Server lock")
+            await user.timeout(until, reason=reason)
         except discord.Forbidden:
             await interaction.followup.send("❌ Нет прав ограничить этого пользователя.", ephemeral=True)
             return
 
-        await interaction.followup.send(f"🔒 {user.mention} ограничен {duration_text}.", ephemeral=True)
+        await interaction.followup.send(f"🔒 {user.mention} ограничен {duration_text}.\n**Причина:** {reason}", ephemeral=True)
 
 @app_commands.describe(
     user="Кого разблокировать",
-    scope="Где снять ограничение: канал или сервер"
+    scope="Где снять ограничение: канал или сервер",
+    reason="Причина разблокировки"
 )
 @app_commands.choices(
     scope=[
@@ -297,7 +301,8 @@ async def lock(
 async def unlock(
     interaction: discord.Interaction,
     user: discord.Member,
-    scope: app_commands.Choice[str]
+    scope: app_commands.Choice[str],
+    reason: str
 ):
     await interaction.response.defer(ephemeral=True)
 
@@ -316,15 +321,15 @@ async def unlock(
             return
 
         if chat_banned_role in user.roles:
-            await user.remove_roles(chat_banned_role)
-            await interaction.followup.send(f"🔓 {user.mention} разблокирован в этом канале.", ephemeral=True)
+            await user.remove_roles(chat_banned_role, reason=reason)
+            await interaction.followup.send(f"🔓 {user.mention} разблокирован в этом канале.\n**Причина:** {reason}", ephemeral=True)
         else:
             await interaction.followup.send(f"{user.mention} не был заблокирован в канале.", ephemeral=True)
 
     elif scope.value == "server":
         try:
-            await user.timeout(None)
-            await interaction.followup.send(f"🔓 {user.mention} разблокирован на сервере.", ephemeral=True)
+            await user.timeout(None, reason=reason)
+            await interaction.followup.send(f"🔓 {user.mention} разблокирован на сервере.\n**Причина:** {reason}", ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send("❌ Нет прав разблокировать пользователя.", ephemeral=True)
 
