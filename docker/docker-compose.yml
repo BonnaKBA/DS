@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  fun-zone:
+    build: .
+    container_name: funzone_app
+    env_file:
+      - .env
+    depends_on:
+      - second_db
+    image: ds
+    restart: unless-stopped
+
+  second_db:
+    image: mysql:8.0
+    container_name: fun_zone_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: fun_zone_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - funzone_db:/var/lib/mysql
+
+  second_phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: fun_zone_phpmyadmin
+    restart: always
+    ports:
+      - "8081:80"
+    environment:
+      PMA_HOST: second_db
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+    depends_on:
+      - second_db
+
+volumes:
+  funzone_db:
