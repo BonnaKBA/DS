@@ -1,0 +1,8 @@
+version: '3.8'
+
+services:
+  fun-zone:
+    build: .
+    container_name: fz
+    image: ds
+    restart: unless-stopped
