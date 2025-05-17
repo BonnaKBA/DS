@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 import discord
+import mysql.connector
+from mysql.connector import Error
 from dotenv import load_dotenv
 from discord.ext import commands
 from discord import app_commands
@@ -15,12 +17,54 @@ CHAT_BANNED_ROLE_ID = int(os.getenv("CHAT_BANNED_ROLE_ID"))
 VOICE_BANNED_ROLE_ID = int(os.getenv("VOICE_BANNED_ROLE_ID"))
 
 intents = discord.Intents.default()
+intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents, application_id=APPLICATION_ID)
 
 USER_FILE = "clear_users.txt"
 
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
+
+def log_moderation_action(
+    action, moderator_id, moderator_name, user_id, user_name,
+    scope, reason, amount=None, unit=None, expires_at=None
+):
+    try:
+        connection = mysql.connector.connect(
+            host=os.getenv("MYSQL_HOST"),
+            port=int(os.getenv("MYSQL_PORT", 3306)),
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASSWORD"),
+            database=os.getenv("MYSQL_DATABASE")
+        )
+
+        cursor = connection.cursor()
+
+        query = """
+            INSERT INTO moderation_logs (
+                action, moderator_id, moderator_name, user_id, user_name,
+                scope, reason, amount, unit, created_at, expires_at, resolved
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, UTC_TIMESTAMP(), %s, %s)
+        """
+
+        # resolved только если channel
+        resolved_value = False if scope == 'channel' else None
+
+        cursor.execute(query, (
+            action, moderator_id, moderator_name, user_id, user_name,
+            scope, reason, amount, unit, expires_at, resolved_value
+        ))
+
+        connection.commit()
+
+    except Error as e:
+        print(f"[MySQL] Ошибка при логировании действия: {e}")
+
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            cursor.close()
+            connection.close()
+
 
 def is_user_allowed(user_id):
     if not os.path.exists(USER_FILE):
@@ -36,6 +80,7 @@ async def on_ready():
     print(f'{bot.user} подключён')
     await bot.tree.sync()
     print("Команды успешно синхронизированы")
+    bot.loop.create_task(check_expired_locks())
 
 @bot.tree.command(name="clear_add", description="Добавить пользователя в список разрешенных")
 async def clear_add(interaction: discord.Interaction, user: discord.User):
@@ -244,7 +289,29 @@ async def lock(
             ephemeral=True
         )
         return
-
+    
+    if scope == "channel":
+        if await asyncio.to_thread(has_scope_lock, user.id, "server"):
+            await interaction.followup.send(
+                f"❌ У пользователя {user.mention} уже есть активная блокировка `server`.",
+                ephemeral=True
+            )
+            return
+        if await asyncio.to_thread(has_scope_lock, user.id, "channel"):
+            await interaction.followup.send(
+                f"❌ У пользователя {user.mention} уже есть активная блокировка `channel`.",
+                ephemeral=True
+            )
+            return
+    
+    elif scope == "server":
+        if await asyncio.to_thread(has_scope_lock, user.id, "server"):
+            await interaction.followup.send(
+                f"❌ У пользователя {user.mention} уже есть активная блокировка `server`.",
+                ephemeral=True
+            )
+            return
+    
     if amount == 0:
         await interaction.followup.send("⚠️ Значение времени не может быть равно 0.", ephemeral=True)
         return
@@ -252,38 +319,117 @@ async def lock(
     if scope == "channel":
         chat_banned_role = interaction.guild.get_role(CHAT_BANNED_ROLE_ID)
         if not chat_banned_role:
-            await interaction.followup.send("Не найдена роль chat banned.", ephemeral=True)
+            await interaction.followup.send("❌ Не найдена роль chat banned.", ephemeral=True)
             return
 
         await user.add_roles(chat_banned_role, reason=reason)
-        await interaction.followup.send(f"🔒 {user.mention} теперь не может писать в этом канале.\n**Причина:** {reason}", ephemeral=True)
+
+        await interaction.followup.send(
+            f"🔒 {user.mention} теперь не может писать в этом канале.\n**Причина:** {reason}",
+            ephemeral=True
+        )
+
+        expires_at = None
+        if amount and unit:
+            seconds = amount * UNITS[unit.value]
+            expires_at = datetime.utcnow() + timedelta(seconds=seconds)
+
+        await asyncio.to_thread(
+            log_moderation_action,
+            action="lock",
+            moderator_id=interaction.user.id,
+            moderator_name=str(interaction.user),
+            user_id=user.id,
+            user_name=str(user),
+            scope=scope,
+            reason=reason,
+            amount=amount,
+            unit=unit.value if unit else None,
+            expires_at=expires_at
+        )
+
         return
 
     elif scope == "server":
         if amount and unit:
             if unit.value not in UNITS:
-                await interaction.followup.send("Неверно указана единица времени.", ephemeral=True)
+                await interaction.followup.send("❌ Неверно указана единица времени.", ephemeral=True)
                 return
-
+    
             seconds = amount * UNITS[unit.value]
             if seconds > MAX_TIMEOUT_SECONDS:
-                await interaction.followup.send("Максимальное время таймаута — 28 дней.", ephemeral=True)
+                await interaction.followup.send("❌ Максимальное время таймаута — 28 дней.", ephemeral=True)
                 return
-
+    
             until = discord.utils.utcnow() + timedelta(seconds=seconds)
             unit_str = get_time_unit(unit.value, amount)
             duration_text = f"на {amount} {unit_str}"
+    
+            # ✅ добавляем expires_at
+            expires_at = datetime.utcnow() + timedelta(seconds=seconds)
         else:
             until = discord.utils.utcnow() + timedelta(days=28)
             duration_text = "максимально (28 дней макс)"
-
+    
+            # ✅ для максимального времени блокировки можно не задавать expires_at (None)
+            expires_at = None
+    
         try:
             await user.timeout(until, reason=reason)
+    
+            await interaction.followup.send(
+                f"🔒 {user.mention} ограничен {duration_text}.\n**Причина:** {reason}",
+                ephemeral=True
+            )
+    
+            await asyncio.to_thread(
+                log_moderation_action,
+                action="lock",
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                user_id=user.id,
+                user_name=str(user),
+                scope=scope,
+                reason=reason,
+                amount=amount,
+                unit=unit.value if unit else None,
+                expires_at=expires_at  # ✅ сохраняем дату окончания
+            )
+    
         except discord.Forbidden:
             await interaction.followup.send("❌ Нет прав ограничить этого пользователя.", ephemeral=True)
-            return
+    
+def has_scope_lock(user_id: int, scope: str) -> bool:
+    try:
+        connection = mysql.connector.connect(
+            host=os.getenv("MYSQL_HOST"),
+            port=int(os.getenv("MYSQL_PORT", 3306)),
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASSWORD"),
+            database=os.getenv("MYSQL_DATABASE")
+        )
 
-        await interaction.followup.send(f"🔒 {user.mention} ограничен {duration_text}.\n**Причина:** {reason}", ephemeral=True)
+        cursor = connection.cursor()
+        query = """
+            SELECT COUNT(*) FROM moderation_logs
+            WHERE user_id = %s AND scope = %s AND action = 'lock'
+            AND (
+                (scope = 'channel' AND resolved = FALSE)
+                OR (scope = 'server' AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP()))
+            )
+        """
+        cursor.execute(query, (user_id, scope))
+        count = cursor.fetchone()[0]
+        return count > 0
+
+    except Error as e:
+        print(f"[MySQL] Ошибка при проверке блокировки: {e}")
+        return False
+
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            cursor.close()
+            connection.close()
 
 @app_commands.describe(
     user="Кого разблокировать",
@@ -313,6 +459,13 @@ async def unlock(
     if user.top_role >= interaction.guild.me.top_role:
         await interaction.followup.send("❌ У пользователя роль выше или равна роли бота. Снятие невозможно.", ephemeral=True)
         return
+    
+    if not await asyncio.to_thread(has_scope_lock, user.id, scope.value):
+        await interaction.followup.send(
+            f"✅ У пользователя {user.mention} нет активной блокировки в области `{scope.value}`.",
+            ephemeral=True
+        )
+        return
 
     if scope.value == "channel":
         chat_banned_role = interaction.guild.get_role(CHAT_BANNED_ROLE_ID)
@@ -322,14 +475,47 @@ async def unlock(
 
         if chat_banned_role in user.roles:
             await user.remove_roles(chat_banned_role, reason=reason)
-            await interaction.followup.send(f"🔓 {user.mention} разблокирован в этом канале.\n**Причина:** {reason}", ephemeral=True)
+            await interaction.followup.send(
+                f"🔓 {user.mention} разблокирован в этом канале.\n**Причина:** {reason}",
+                ephemeral=True
+            )
+
+            await asyncio.to_thread(
+                log_moderation_action,
+                action="unlock",
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                user_id=user.id,
+                user_name=str(user),
+                scope=scope.value,
+                reason=reason
+            )
+
         else:
-            await interaction.followup.send(f"{user.mention} не был заблокирован в канале.", ephemeral=True)
+            await interaction.followup.send(
+                f"{user.mention} не был заблокирован в канале.",
+                ephemeral=True
+            )
 
     elif scope.value == "server":
         try:
             await user.timeout(None, reason=reason)
-            await interaction.followup.send(f"🔓 {user.mention} разблокирован на сервере.\n**Причина:** {reason}", ephemeral=True)
+            await interaction.followup.send(
+                f"🔓 {user.mention} разблокирован на сервере.\n**Причина:** {reason}",
+                ephemeral=True
+            )
+
+            await asyncio.to_thread(
+                log_moderation_action,
+                action="unlock",
+                moderator_id=interaction.user.id,
+                moderator_name=str(interaction.user),
+                user_id=user.id,
+                user_name=str(user),
+                scope=scope.value,
+                reason=reason
+            )
+    
         except discord.Forbidden:
             await interaction.followup.send("❌ Нет прав разблокировать пользователя.", ephemeral=True)
 
@@ -340,5 +526,63 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             "❌ У вас нет прав администратора для использования данной команды.",
             ephemeral=True
         )
+
+async def check_expired_locks():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            connection = mysql.connector.connect(
+                host=os.getenv("MYSQL_HOST"),
+                port=int(os.getenv("MYSQL_PORT", 3306)),
+                user=os.getenv("MYSQL_USER"),
+                password=os.getenv("MYSQL_PASSWORD"),
+                database=os.getenv("MYSQL_DATABASE")
+            )
+            cursor = connection.cursor(dictionary=True)
+
+            query = """
+                SELECT * FROM moderation_logs
+                WHERE action = 'lock'
+                AND scope = 'channel'
+                AND resolved = FALSE
+                AND expires_at IS NOT NULL
+                AND expires_at <= UTC_TIMESTAMP()
+            """
+            cursor.execute(query)
+            expired_locks = cursor.fetchall()
+
+            for lock in expired_locks:
+                guild = bot.get_guild(int(os.getenv("GUILD_ID")))
+                if not guild:
+                    continue
+
+                member = guild.get_member(lock["user_id"])
+                if not member:
+                    continue
+
+                role = guild.get_role(CHAT_BANNED_ROLE_ID)
+                if role and role in member.roles:
+                    try:
+                        await member.remove_roles(role, reason="Автоматическая разблокировка")
+                    except Exception as e:
+                        print(f"[AutoUnlock] Не удалось снять роль: {e}")
+
+                update_query = """
+                    UPDATE moderation_logs SET resolved = TRUE
+                    WHERE id = %s
+                """
+                cursor.execute(update_query, (lock["id"],))
+                connection.commit()
+                print(f"[AutoUnlock] Разблокирован {member} в области {lock['scope']}")
+
+        except Error as e:
+            print(f"[MySQL] Ошибка при проверке истекших блокировок: {e}")
+
+        finally:
+            if 'connection' in locals() and connection.is_connected():
+                cursor.close()
+                connection.close()
+
+        await asyncio.sleep(60)  # Проверка каждую минуту
 
 bot.run(TOKEN)
